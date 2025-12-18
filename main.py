@@ -2,46 +2,47 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, Input
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, Input
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.regularizers import l2
 from sklearn.metrics import classification_report, confusion_matrix
 
+#Configuration
+DATASET_PATH = "dataset" 
+IMAGE_SIZE = (128, 128)
+BATCH_SIZE = 32
+SEED = 42
 
-# 1. Dataset Path
-
-DATASET_PATH = "dataset"
-
-
-# 2. Load Dataset
-
+#Load Dataset
+print("--- Loading Br35H Dataset ---")
 train_data_raw = tf.keras.utils.image_dataset_from_directory(
     DATASET_PATH,
+    labels='inferred',
+    label_mode='binary',
+    class_names=['no', 'yes'],
     validation_split=0.2,
     subset="training",
-    seed=42,
-    image_size=(128, 128),
-    batch_size=32,
-    label_mode='binary'
+    seed=SEED,
+    image_size=IMAGE_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=True
 )
 
 val_data_raw = tf.keras.utils.image_dataset_from_directory(
     DATASET_PATH,
+    labels='inferred',
+    label_mode='binary',
+    class_names=['no', 'yes'],
     validation_split=0.2,
     subset="validation",
-    seed=42,
-    image_size=(128, 128),
-    batch_size=32,
-    label_mode='binary'
+    seed=SEED,
+    image_size=IMAGE_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=True
 )
 
-# Save class names
-class_names = train_data_raw.class_names
-class_indices = {name: idx for idx, name in enumerate(class_names)}
-print("\nClass indices:", class_indices)
-
-
-# 3. Data Augmentation and Normalization
 
 data_augmentation = tf.keras.Sequential([
     tf.keras.layers.RandomFlip("horizontal"),
@@ -50,89 +51,112 @@ data_augmentation = tf.keras.Sequential([
 ])
 
 AUTOTUNE = tf.data.AUTOTUNE
-
-train_data = train_data_raw.map(lambda x, y: (data_augmentation(x, training=True)/255.0, y))
-train_data = train_data.prefetch(buffer_size=AUTOTUNE)
-
-val_data = val_data_raw.map(lambda x, y: (x/255.0, y))
-val_data = val_data.prefetch(buffer_size=AUTOTUNE)
+train_data = train_data_raw.map(lambda x, y: (data_augmentation(x, training=True)/255.0, y)).prefetch(AUTOTUNE)
+val_data = val_data_raw.map(lambda x, y: (x/255.0, y)).prefetch(AUTOTUNE)
 
 
-# 4. Build CNN Model
+base_model = MobileNetV2(input_shape=IMAGE_SIZE + (3,), include_top=False, weights='imagenet')
+base_model.trainable = False
 
 model = Sequential([
-    Input(shape=(128,128,3)),
-    Conv2D(32, (3,3), activation='relu'),
-    MaxPooling2D(2,2),
-    Conv2D(64, (3,3), activation='relu'),
-    MaxPooling2D(2,2),
-    Flatten(),
-    Dense(128, activation='relu'),
-    Dropout(0.5),
-    Dense(1, activation='sigmoid')  # Binary classification
+    Input(shape=IMAGE_SIZE + (3,)),
+    base_model,
+    GlobalAveragePooling2D(),
+    Dense(128, activation='relu', kernel_regularizer=l2(0.01)), 
+    Dropout(0.7),
+    Dense(1, activation='sigmoid')
 ])
 
-model.compile(
-    optimizer=Adam(learning_rate=0.001),
-    loss='binary_crossentropy',
-    metrics=['accuracy']
-)
+# Training
+print("\n--- Phase 1: Feature Extraction ---")
+model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+history_p1 = model.fit(train_data, validation_data=val_data, epochs=5)
 
-model.summary()
+print("\n--- Phase 2: Fine-Tuning ---")
+base_model.trainable = True
+for layer in base_model.layers[:-20]:
+    layer.trainable = False
 
+model.compile(optimizer=Adam(learning_rate=0.00001), loss='binary_crossentropy', metrics=['accuracy'])
+history_p2 = model.fit(train_data, validation_data=val_data, epochs=10)
 
-# 5. Train Model
-
-EPOCHS = 15
-
-history = model.fit(
-    train_data,
-    validation_data=val_data,
-    epochs=EPOCHS
-)
-
-
-# 6. Evaluate Model
 
 val_loss, val_acc = model.evaluate(val_data)
-print(f"\n Validation Accuracy: {val_acc*100:.2f}%")
+print(f"\n Final Validation Accuracy: {val_acc*100:.2f}%")
 
 
-# 7. Plot Accuracy & Loss
+print("\n--- Generating Training Graphics ---")
+acc = history_p1.history['accuracy'] + history_p2.history['accuracy']
+val_acc_list = history_p1.history['val_accuracy'] + history_p2.history['val_accuracy']
+loss = history_p1.history['loss'] + history_p2.history['loss']
+val_loss_list = history_p1.history['val_loss'] + history_p2.history['val_loss']
 
-plt.figure(figsize=(12,5))
+plt.figure(figsize=(14, 6))
 
-plt.subplot(1,2,1)
-plt.plot(history.history['accuracy'], label='Train Accuracy')
-plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
-plt.legend()
-plt.title('Accuracy')
+# Subplot 1: Accuracy
+plt.subplot(1, 2, 1)
+plt.plot(acc, label='Train Accuracy', color='teal', linewidth=2)
+plt.plot(val_acc_list, label='Val Accuracy', color='orange', linestyle='--')
+plt.axvline(x=4, color='red', linestyle=':', label='Fine-tuning Start')
+plt.title('Accuracy: Phase 1 & 2')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend(loc='lower right')
+plt.grid(True, alpha=0.3)
 
-plt.subplot(1,2,2)
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.legend()
-plt.title('Loss')
+# Subplot 2: Loss
+plt.subplot(1, 2, 2)
+plt.plot(loss, label='Train Loss', color='teal', linewidth=2)
+plt.plot(val_loss_list, label='Val Loss', color='orange', linestyle='--')
+plt.axvline(x=4, color='red', linestyle=':', label='Fine-tuning Start')
+plt.title('Loss: Phase 1 & 2')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend(loc='upper right')
+plt.grid(True, alpha=0.3)
 
-plt.savefig('training_results.png')
+plt.tight_layout()
+os.makedirs("results", exist_ok=True)
+plt.savefig('results/main_approach_metrics.png')
+print("[INFO] Graphics saved to 'results/main_approach_metrics.png'")
 plt.show()
 
+print("\n--- Generating Balanced Evaluation Metrics ---")
 
-# 8. Generate Predictions & Report
+val_data_final_raw = tf.keras.utils.image_dataset_from_directory(
+    DATASET_PATH,
+    labels='inferred',
+    label_mode='binary',
+    class_names=['no', 'yes'],
+    validation_split=0.2,
+    subset="validation",
+    seed=SEED,
+    image_size=IMAGE_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=True # Shuffling ensures we get a mix of both classes 
+)
 
-y_true = np.concatenate([y.numpy() for x, y in val_data], axis=0)
-y_pred = np.concatenate([model.predict(x) for x, y in val_data], axis=0)
-y_pred_classes = (y_pred > 0.5).astype(int)
+val_data_final = val_data_final_raw.map(lambda x, y: (x/255.0, y))
 
-print("\nClassification Report:")
-print(classification_report(y_true, y_pred_classes, target_names=class_names))
+y_true = []
+y_pred = []
 
-cm = confusion_matrix(y_true, y_pred_classes)
-print("\nConfusion Matrix:\n", cm)
+for x, y in val_data_final:
+    y_true.extend(y.numpy())
+    preds = model.predict(x, verbose=0)
+    y_pred.extend((preds > 0.5).astype(int))
 
+y_true = np.array(y_true).flatten()
+y_pred = np.array(y_pred).flatten()
 
-# 9. Save the Model 
+print("\nClassification Report (Balanced Support):")
+print(classification_report(y_true, y_pred, target_names=['no', 'yes']))
 
+cm = confusion_matrix(y_true, y_pred)
+print("\nConfusion Matrix (Balanced Support):")
+print(cm)
+
+#Save
 os.makedirs("models", exist_ok=True)
-model.save("models/baseline_cnn.keras")
-print("\n Model saved successfully to 'models/baseline_cnn.keras'")
+model.save("models/main_approach_mobilenet.keras")
+print("\n Final Model saved to 'models/main_approach_mobilenet.keras'")
